@@ -1,0 +1,978 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>VOLT DRIVE</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#000; touch-action:none; }
+  #game { width:100%; height:100%; display:block; image-rendering:pixelated; image-rendering:crisp-edges; }
+  .ui {
+    position:fixed; inset:0; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; pointer-events:none;
+    font-family:"Courier New", ui-monospace, monospace; color:#cfe8ff;
+    text-shadow:2px 2px 0 #000, -1px -1px 0 #1a0a2e;
+    letter-spacing:2px; text-transform:uppercase; text-align:center;
+  }
+  #title h1 {
+    font-size:clamp(34px,9vw,76px); font-weight:bold; color:#ffe75c;
+    text-shadow:3px 3px 0 #b3261e, 6px 6px 0 #000; margin-bottom:8px;
+  }
+  #title .sub { font-size:clamp(11px,2.6vw,15px); color:#9fb4d8; margin-bottom:34px; }
+  .blink { animation:blink 1s steps(1) infinite; font-size:clamp(14px,3.4vw,20px); color:#fff; }
+  @keyframes blink { 50% { opacity:0; } }
+  #hud {
+    justify-content:flex-start; align-items:stretch; flex-direction:row;
+    padding:14px 18px; display:none; font-size:clamp(13px,3vw,18px);
+  }
+  #hud .left { text-align:left; flex:1; }
+  #hud .right { text-align:right; flex:1; color:#ffe75c; }
+  #gameover { display:none; }
+  #gameover h2 {
+    font-size:clamp(26px,7vw,52px); color:#ff5c5c;
+    text-shadow:3px 3px 0 #000; margin-bottom:14px;
+  }
+  #gameover .score { font-size:clamp(15px,4vw,24px); color:#ffe75c; margin-bottom:6px; }
+  #gameover .best  { font-size:clamp(12px,3vw,16px); color:#9fb4d8; margin-bottom:30px; }
+  .hint { position:fixed; bottom:18px; left:0; right:0; text-align:center;
+    font-size:clamp(10px,2.4vw,13px); color:#6f84a8; }
+  #vignette { position:fixed; inset:0; pointer-events:none;
+    background:radial-gradient(ellipse at center, transparent 58%, rgba(0,0,10,.55) 100%); }
+  #notice {
+    position:fixed; top:16%; left:0; right:0; text-align:center; pointer-events:none;
+    font-family:"Courier New", ui-monospace, monospace;
+    font-size:clamp(15px,4vw,26px); color:#ffe75c; letter-spacing:3px;
+    text-transform:uppercase; text-shadow:2px 2px 0 #b3261e, 4px 4px 0 #000;
+    opacity:0; transition:opacity .25s;
+  }
+  @media (prefers-reduced-motion: reduce) { .blink { animation:none; } }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="vignette"></div>
+<div id="notice"></div>
+
+<div class="ui" id="title">
+  <h1>VOLT&nbsp;DRIVE</h1>
+  <div class="sub">night circuit &middot; hit ramps to fly &middot; dodge cones &amp; traffic</div>
+  <div class="blink" id="startTxt">tap or press enter</div>
+  <div class="hint">steer: &larr; &rarr; / A D &nbsp;&middot;&nbsp; touch left / right side</div>
+</div>
+
+<div class="ui" id="hud">
+  <div class="left">DIST<br><span id="dist">0</span>m</div>
+  <div class="right">CELLS &#9889;<br><span id="cells">0</span></div>
+</div>
+
+<div class="ui" id="gameover">
+  <h2>YOU CRASHED</h2>
+  <div class="score">score <span id="finalScore">0</span></div>
+  <div class="best">best <span id="bestScore">0</span></div>
+  <div class="blink">tap or press enter to retry</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(function(){
+"use strict";
+
+/* ============================================================
+   PSX-STYLE RENDERER
+   - scene rendered into a 320x240 target (real PS1 resolution)
+   - vertex positions snapped to a coarse grid -> polygon wobble
+   - post pass: 4x4 bayer dither + 15-bit colour crush
+   ============================================================ */
+
+var LOW_W = 320, LOW_H = 240;
+var canvas = document.getElementById('game');
+var renderer = new THREE.WebGLRenderer({ canvas:canvas, antialias:false });
+renderer.setPixelRatio(1);
+
+var scene = new THREE.Scene();
+var camera = new THREE.PerspectiveCamera(62, LOW_W/LOW_H, 0.1, 90);
+
+var FOG_COLOR = new THREE.Color(0x16102e);   // current biome fog (mutated at runtime)
+var FOG_NEAR = 8, FOG_FAR = 46;
+scene.background = FOG_COLOR;
+
+/* ---- BIOMES: each is just a palette the world repaints itself with ---- */
+var BIOMES = [
+  { name:'NIGHT CITY', fog:0x16102e, hillA:0x1d2b4f, hillB:0x232145, road:0x2a2a33, lamp:0xffe9a0 },
+  { name:'SUNSET DESERT', fog:0x3a1d2e, hillA:0x5a3528, hillB:0x6e4030, road:0x3a3030, lamp:0xffd080 },
+  { name:'TOXIC SWAMP', fog:0x0e2418, hillA:0x1c3a26, hillB:0x244a2e, road:0x232a26, lamp:0xb6ff7a },
+  { name:'ARCTIC NIGHT', fog:0x1a2838, hillA:0x36506a, hillB:0x42627e, road:0x2c343c, lamp:0xd6f0ff },
+  { name:'NEON GRID', fog:0x1a0a2e, hillA:0x3a1060, hillB:0x55187a, road:0x241830, lamp:0xff6cf0 }
+];
+var biomeIdx = 0;
+function applyBiome(b){
+  FOG_COLOR.set(b.fog);
+  scene.background = FOG_COLOR;
+}
+
+var lowTarget = new THREE.WebGLRenderTarget(LOW_W, LOW_H, {
+  minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter, depthBuffer:true
+});
+
+/* fullscreen quad with dither shader */
+var postScene = new THREE.Scene();
+var postCam = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+var postMat = new THREE.ShaderMaterial({
+  uniforms:{ tex:{value:lowTarget.texture}, res:{value:new THREE.Vector2(LOW_W,LOW_H)} },
+  vertexShader:
+    "varying vec2 vUv;"+
+    "void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }",
+  fragmentShader:
+    "uniform sampler2D tex; uniform vec2 res; varying vec2 vUv;"+
+    "float Bayer2(vec2 a){ a=floor(a); return fract(a.x/2.+a.y*a.y*.75); }"+
+    "void main(){"+
+    "  vec2 p = floor(vUv*res);"+
+    "  float d = Bayer2(.5*p)*.25 + Bayer2(p);"+   // 4x4 bayer 0..~1
+    "  vec3 c = texture2D(tex, vUv).rgb;"+
+    "  c = floor(c*31.0 + d) / 31.0;"+             // 15-bit colour + dither
+    "  gl_FragColor = vec4(c,1.0);"+
+    "}"
+});
+postScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2), postMat));
+
+/* PSX material: vertex colours, vertex snapping, distance fog, cheap lambert */
+function psxMaterial(){
+  return new THREE.ShaderMaterial({
+    uniforms:{
+      fogColor:{value:FOG_COLOR},
+      fogNear:{value:FOG_NEAR},
+      fogFar:{value:FOG_FAR},
+      snap:{value:new THREE.Vector2(LOW_W/2, LOW_H/2)} // half-res snap = juicy wobble
+    },
+    vertexShader:
+      "uniform vec2 snap;"+
+      "varying vec3 vColor; varying float vDist; varying float vLight;"+
+      "void main(){"+
+      "  vColor = color;"+
+      "  vec4 mv = modelViewMatrix * vec4(position,1.0);"+
+      "  vDist = length(mv.xyz);"+
+      "  vec3 n = normalize(normalMatrix * normal);"+
+      "  vLight = 0.55 + 0.45*max(dot(n, normalize(vec3(0.3,0.9,0.4))),0.0);"+
+      "  vec4 clip = projectionMatrix * mv;"+
+      "  clip.xyz /= clip.w;"+
+      "  clip.xy = floor(clip.xy * snap + 0.5) / snap;"+   // <- the wobble
+      "  clip.xyz *= clip.w;"+
+      "  gl_Position = clip;"+
+      "}",
+    fragmentShader:
+      "uniform vec3 fogColor; uniform float fogNear; uniform float fogFar;"+
+      "varying vec3 vColor; varying float vDist; varying float vLight;"+
+      "void main(){"+
+      "  vec3 c = vColor * vLight;"+
+      "  float f = smoothstep(fogNear, fogFar, vDist);"+
+      "  gl_FragColor = vec4(mix(c, fogColor, f), 1.0);"+
+      "}",
+    vertexColors:true,
+    side:THREE.DoubleSide
+  });
+}
+var MAT = psxMaterial();
+
+/* helper: paint a whole geometry one flat colour (with slight face variance) */
+function paint(geo, hex, vary){
+  geo = geo.toNonIndexed();
+  geo.computeVertexNormals();
+  var base = new THREE.Color(hex);
+  var cols = [];
+  var count = geo.attributes.position.count;
+  for(var f=0; f<count; f+=3){
+    var v = vary ? (Math.random()*vary - vary/2) : 0;
+    var c = base.clone().offsetHSL(0, 0, v);
+    for(var k=0;k<3;k++) cols.push(c.r,c.g,c.b);
+  }
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(cols,3));
+  return geo;
+}
+function mesh(geo){ return new THREE.Mesh(geo, MAT); }
+
+/* ============================================================
+   WORLD
+   ============================================================ */
+
+var LANES = [-2.3, 0, 2.3];   // grows up to 7 lanes as you survive
+var laneCount = 3;
+var ROAD_W = 0, roadCenter = 0;
+function roadDims(){
+  var min = LANES[0], max = LANES[LANES.length-1];
+  roadCenter = (min + max) / 2;
+  ROAD_W = (max - min) + 2.3 + 1.5;
+}
+roadDims();
+var SEG_LEN = 12, SEG_COUNT = 6;
+
+/* road segments (recycled as they pass the camera, rebuilt when road widens) */
+var roadSegs = [];
+function buildSegment(g){
+  while(g.children.length) g.remove(g.children[0]);
+  var asphalt = mesh(paint(new THREE.BoxGeometry(ROAD_W, .3, SEG_LEN), BIOMES[biomeIdx].road, .05));
+  asphalt.position.set(roadCenter, -.15, 0);
+  g.add(asphalt);
+  // a dashed stripe on every lane boundary
+  for(var b=0;b<laneCount-1;b++){
+    var bx = (LANES[b] + LANES[b+1]) / 2;
+    for(var s=0;s<3;s++){
+      var stripe = mesh(paint(new THREE.BoxGeometry(.16,.05,2.2), 0xb8b89a));
+      stripe.position.set(bx, .03, -SEG_LEN/2 + 2 + s*4);
+      g.add(stripe);
+    }
+  }
+  for(var side=-1; side<=1; side+=2){
+    var rail = mesh(paint(new THREE.BoxGeometry(.2,.5,SEG_LEN), 0x6a6f7a, .08));
+    rail.position.set(roadCenter + side*(ROAD_W/2+.1), .35, 0);
+    g.add(rail);
+    if(side===1) g.userData.railR = rail;
+  }
+}
+(function(){
+  for(var i=0;i<SEG_COUNT;i++){
+    var g = new THREE.Group();
+    buildSegment(g);
+    g.position.z = -i*SEG_LEN;
+    scene.add(g);
+    roadSegs.push(g);
+  }
+})();
+
+function rebuildRoad(){
+  roadDims();
+  roadSegs.forEach(buildSegment);
+  lamps.forEach(function(L){
+    L.position.x = roadCenter + L.userData.side*(ROAD_W/2+.7);
+  });
+  hills.forEach(function(h){
+    if(Math.abs(h.position.x - roadCenter) < ROAD_W/2 + 2){
+      var s = (h.position.x >= roadCenter) ? 1 : -1;
+      h.position.x = roadCenter + s*(ROAD_W/2 + 2.5 + Math.random()*5);
+    }
+  });
+}
+/* ---- ROAD RESHAPE: lane count randomly jumps between 2, 3 and 4 ----
+   The road animates wider OR narrower. Car & safe-lane are clamped so a
+   shrinking road never traps you off the edge. */
+var nextReshapeDist = 350 + Math.random()*250;
+var reshapeAnim = null;
+function laneXs(n){
+  var xs = [], start = -((n-1)*2.3)/2;
+  for(var i=0;i<n;i++) xs.push(start + i*2.3);
+  return xs;
+}
+var reshapePending = false;
+/* true only when no obstacle/traffic is still ahead of the car, so a lane
+   change can't strand already-placed cones in unreachable positions */
+function roadAheadClear(){
+  function anyAhead(pool){
+    for(var i=0;i<pool.length;i++){
+      if(pool[i].active && pool[i].obj.position.z < 6) return true;
+    }
+    return false;
+  }
+  if(anyAhead(cones) || anyAhead(traffic) || anyAhead(sweepers) || anyAhead(ramps)) return false;
+  // also wait until the next spawn point is far enough that the fresh layout
+  // has room to lay down a clean pattern
+  return spawnZ < -40;
+}
+function reshapeRoad(){
+  var choices = [2,3,4].filter(function(n){ return n!==laneCount; });
+  var target = choices[Math.floor(Math.random()*choices.length)];
+  LANES = laneXs(target);
+  laneCount = target;
+  if(lane > target-1) lane = target-1;
+  if(safeLane > target-1) safeLane = target-1;
+  roadDims();
+  rebuildRoad();
+  showNotice(target + ' LANES');
+  sfxWiden();
+  reshapeAnim = { t:0, dur:0.6, fromFar:MAT.uniforms.fogFar.value, toFar:FOG_FAR + (target-3)*4 };
+}
+
+/* ---- BIOME SWITCH: repaint hills, lamps, road & fog every so often ---- */
+var nextBiomeDist = 600 + Math.random()*300;
+function switchBiome(){
+  biomeIdx = (biomeIdx + 1 + Math.floor(Math.random()*(BIOMES.length-1))) % BIOMES.length;
+  var b = BIOMES[biomeIdx];
+  applyBiome(b);
+  rebuildRoad();
+  hills.forEach(function(h){
+    var hue = Math.random()<.5 ? b.hillA : b.hillB;
+    h.geometry = paint(h.geometry, hue, .12);
+  });
+  lamps.forEach(function(L){
+    if(L.userData.head) L.userData.head.geometry = paint(L.userData.head.geometry, b.lamp);
+  });
+  showNotice(b.name);
+  sfxWiden();
+}
+
+/* low-poly hills along both sides */
+var hills = [];
+(function(){
+  for(var i=0;i<26;i++){
+    var h = .8 + Math.random()*3.4;
+    var geo = new THREE.ConeGeometry(2+Math.random()*3.5, h, 4+Math.floor(Math.random()*3));
+    var hue = Math.random()<.5 ? BIOMES[biomeIdx].hillA : BIOMES[biomeIdx].hillB;
+    var m = mesh(paint(geo, hue, .12));
+    var side = i%2===0 ? -1 : 1;
+    m.position.set(side*(6.5+Math.random()*7), h/2-.2, -Math.random()*70);
+    m.rotation.y = Math.random()*Math.PI;
+    scene.add(m); hills.push(m);
+  }
+})();
+
+/* street lights */
+var lamps = [];
+(function(){
+  for(var i=0;i<8;i++){
+    var g = new THREE.Group();
+    var pole = mesh(paint(new THREE.BoxGeometry(.18,3.6,.18), 0x3a3f4c));
+    pole.position.y = 1.8; g.add(pole);
+    var head = mesh(paint(new THREE.BoxGeometry(.9,.22,.3), BIOMES[biomeIdx].lamp));
+    head.position.set(.45,3.55,0); g.add(head);
+    g.userData.head = head;
+    var side = i%2===0 ? -1 : 1;
+    g.userData.side = side;
+    g.position.set(side*(ROAD_W/2+.7), 0, -i*11);
+    g.scale.x = side===1 ? -1 : 1;
+    scene.add(g); lamps.push(g);
+  }
+})();
+
+/* the car */
+var car = new THREE.Group();
+(function(){
+  var body = mesh(paint(new THREE.BoxGeometry(1.5,.5,2.6), 0xd8442e, .05));
+  body.position.y = .42; car.add(body);
+  var cabin = mesh(paint(new THREE.BoxGeometry(1.2,.45,1.2), 0x16202e));
+  cabin.position.set(0,.85,.1); car.add(cabin);
+  var spoiler = mesh(paint(new THREE.BoxGeometry(1.5,.1,.4), 0xd8442e));
+  spoiler.position.set(0,.85,1.25); car.add(spoiler);
+  for(var i=0;i<4;i++){
+    var w = mesh(paint(new THREE.BoxGeometry(.32,.55,.55), 0x111114));
+    w.position.set(i%2?-.78:.78, .28, i<2?-.85:.95);
+    car.add(w);
+  }
+  // headlights + taillights
+  for(var s=-1;s<=1;s+=2){
+    var hl = mesh(paint(new THREE.BoxGeometry(.26,.16,.06), 0xfff6c8));
+    hl.position.set(s*.5,.45,-1.32); car.add(hl);
+    var tl = mesh(paint(new THREE.BoxGeometry(.26,.14,.06), 0xff3a3a));
+    tl.position.set(s*.5,.45,1.32); car.add(tl);
+  }
+  scene.add(car);
+})();
+
+/* obstacle + pickup pools */
+function makeCone(){
+  var g = new THREE.Group();
+  var c = mesh(paint(new THREE.ConeGeometry(.42,1.0,6), 0xe8742a, .06));
+  c.position.y = .5; g.add(c);
+  var b = mesh(paint(new THREE.BoxGeometry(.85,.12,.85), 0xc9561c));
+  b.position.y = .06; g.add(b);
+  g.visible = false; scene.add(g);
+  return { obj:g, active:false, kind:'cone' };
+}
+function makeCell(){
+  var g = new THREE.Group();
+  var body = mesh(paint(new THREE.BoxGeometry(.38,.6,.38), 0xffd83a, .04));
+  body.position.y = 1.05; g.add(body);
+  var cap = mesh(paint(new THREE.BoxGeometry(.16,.13,.16), 0xb9c4cf));
+  cap.position.y = 1.42; g.add(cap);
+  g.visible = false; scene.add(g);
+  return { obj:g, active:false, kind:'cell' };
+}
+var cones = [], cellsPool = [];
+for(var i=0;i<60;i++) cones.push(makeCone());
+for(var j=0;j<18;j++) cellsPool.push(makeCell());
+
+/* ramps: a wedge you drive up to launch into the air */
+function wedgeGeo(w,h,l){
+  var hw=w/2, hl=l/2;
+  var v = [
+    // sloped top (low edge faces the player)
+    -hw,0, hl,   hw,0, hl,   hw,h,-hl,
+    -hw,0, hl,   hw,h,-hl,  -hw,h,-hl,
+    // tall back face
+    -hw,h,-hl,   hw,h,-hl,   hw,0,-hl,
+    -hw,h,-hl,   hw,0,-hl,  -hw,0,-hl,
+    // sides
+    -hw,0, hl,  -hw,h,-hl,  -hw,0,-hl,
+     hw,0, hl,   hw,0,-hl,   hw,h,-hl
+  ];
+  var g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(v,3));
+  return g;
+}
+function makeRamp(){
+  var g = new THREE.Group();
+  var w = mesh(paint(wedgeGeo(1.9,.95,2.6), 0x3a8fd4, .05));
+  g.add(w);
+  for(var s=-1;s<=1;s+=2){
+    var stripe = mesh(paint(new THREE.BoxGeometry(.18,.06,2.4), 0xffe75c));
+    stripe.position.set(s*.6,.5,-.12);
+    stripe.rotation.x = Math.atan2(.95,2.6);
+    g.add(stripe);
+  }
+  g.visible = false; scene.add(g);
+  return { obj:g, active:false };
+}
+/* traffic: slower cars you overtake (or jump over) */
+var TRAFFIC_COLORS = [0x3a78c2, 0x7a52a8, 0x4a9a5c, 0xb0892c];
+function makeTraffic(){
+  var g = new THREE.Group();
+  var col = TRAFFIC_COLORS[Math.floor(Math.random()*TRAFFIC_COLORS.length)];
+  var body = mesh(paint(new THREE.BoxGeometry(1.5,.55,2.8), col, .05));
+  body.position.y = .45; g.add(body);
+  var cabin = mesh(paint(new THREE.BoxGeometry(1.2,.45,1.3), 0x1a2230));
+  cabin.position.set(0,.9,-.1); g.add(cabin);
+  for(var i=0;i<4;i++){
+    var w = mesh(paint(new THREE.BoxGeometry(.3,.5,.5), 0x111114));
+    w.position.set(i%2?-.78:.78, .25, i<2?-.95:.95);
+    g.add(w);
+  }
+  for(var s=-1;s<=1;s+=2){
+    var tl = mesh(paint(new THREE.BoxGeometry(.28,.14,.06), 0xff3a3a));
+    tl.position.set(s*.5,.5,1.42); g.add(tl);  // rear faces the player
+  }
+  g.visible = false; scene.add(g);
+  return { obj:g, active:false, speed:0 };
+}
+var ramps = [], traffic = [];
+for(var r=0;r<4;r++) ramps.push(makeRamp());
+for(var tcar=0;tcar<6;tcar++) traffic.push(makeTraffic());
+
+/* sweepers: hazards that slide side to side across all lanes */
+function makeSweeper(){
+  var g = new THREE.Group();
+  var c = mesh(paint(new THREE.ConeGeometry(.42,1.0,6), 0xe0306a, .05));
+  c.position.y = .5; g.add(c);
+  var eye = mesh(paint(new THREE.BoxGeometry(.22,.22,.22), 0xfff0f5));
+  eye.position.y = 1.12; g.add(eye);
+  g.visible = false; scene.add(g);
+  return { obj:g, active:false, dir:1 };
+}
+var sweepers = [];
+for(var sw=0;sw<4;sw++) sweepers.push(makeSweeper());
+
+/* ============================================================
+   AUDIO  (tiny chip-style synth)
+   ============================================================ */
+var AC = null;
+function audio(){ if(!AC){ try{ AC = new (window.AudioContext||window.webkitAudioContext)(); }catch(e){} } return AC; }
+function beep(freq, dur, type, vol, slide){
+  var ac = audio(); if(!ac) return;
+  var o = ac.createOscillator(), g = ac.createGain();
+  o.type = type||'square'; o.frequency.value = freq;
+  if(slide) o.frequency.exponentialRampToValueAtTime(slide, ac.currentTime+dur);
+  g.gain.setValueAtTime(vol||.12, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001, ac.currentTime+dur);
+  o.connect(g).connect(ac.destination);
+  o.start(); o.stop(ac.currentTime+dur);
+}
+function sfxPickup(){ beep(740,.07,'square',.10); setTimeout(function(){beep(1180,.12,'square',.10);},60); }
+function sfxCrash(){
+  beep(160,.5,'sawtooth',.18,40);
+  var ac = audio(); if(!ac) return;
+  var len = ac.sampleRate*.4, buf = ac.createBuffer(1,len,ac.sampleRate), d = buf.getChannelData(0);
+  for(var i=0;i<len;i++) d[i] = (Math.random()*2-1)*(1-i/len);
+  var s = ac.createBufferSource(), g = ac.createGain();
+  g.gain.value = .2; s.buffer = buf; s.connect(g).connect(ac.destination); s.start();
+}
+function sfxStart(){ beep(330,.1,'square',.1); setTimeout(function(){beep(440,.1,'square',.1);},110); setTimeout(function(){beep(660,.2,'square',.1);},220); }
+function sfxWiden(){
+  [392,523,659,784].forEach(function(f,i){
+    setTimeout(function(){ beep(f,.12,'square',.1); }, i*90);
+  });
+}
+var noticeTimer = null;
+function showNotice(txt){
+  var el = document.getElementById('notice');
+  el.textContent = txt;
+  el.style.opacity = 1;
+  if(noticeTimer) clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(function(){ el.style.opacity = 0; }, 1700);
+}
+
+/* engine hum */
+var engOsc=null, engGain=null;
+function engineOn(){
+  var ac = audio(); if(!ac || engOsc) return;
+  engOsc = ac.createOscillator(); engGain = ac.createGain();
+  engOsc.type='sawtooth'; engOsc.frequency.value=55;
+  engGain.gain.value=.035;
+  engOsc.connect(engGain).connect(ac.destination); engOsc.start();
+}
+function engineOff(){ if(engOsc){ try{engOsc.stop();}catch(e){} engOsc=null; } }
+
+/* ============================================================
+   GAME STATE
+   ============================================================ */
+var STATE = 'title';      // title | play | dead
+var lane = 1, carX = 0, carVX = 0;
+var speed = 0, dist = 0, cellCount = 0, spawnZ = -60;
+var shake = 0, best = 0;
+var vy = 0, airY = 0;              // jump physics
+var safeLane = 1;                  // the always-survivable path
+var gameOverTimer = null, canRestart = true;
+
+var elTitle = document.getElementById('title'),
+    elHud = document.getElementById('hud'),
+    elOver = document.getElementById('gameover'),
+    elDist = document.getElementById('dist'),
+    elCells = document.getElementById('cells'),
+    elFinal = document.getElementById('finalScore'),
+    elBest = document.getElementById('bestScore');
+
+function startGame(){
+  STATE = 'play';
+  if(gameOverTimer){ clearTimeout(gameOverTimer); gameOverTimer = null; }
+  LANES = [-2.3, 0, 2.3]; laneCount = 3;
+  nextReshapeDist = 350 + Math.random()*250;
+  nextBiomeDist = 600 + Math.random()*300;
+  reshapeAnim = null;
+  reshapePending = false;
+  biomeIdx = Math.floor(Math.random()*BIOMES.length);
+  applyBiome(BIOMES[biomeIdx]);
+  MAT.uniforms.fogFar.value = FOG_FAR;
+  roadDims();
+  rebuildRoad();
+  // repaint scenery for the starting biome
+  hills.forEach(function(h){
+    var hue = Math.random()<.5 ? BIOMES[biomeIdx].hillA : BIOMES[biomeIdx].hillB;
+    h.geometry = paint(h.geometry, hue, .12);
+  });
+  lamps.forEach(function(L){
+    if(L.userData.head) L.userData.head.geometry = paint(L.userData.head.geometry, BIOMES[biomeIdx].lamp);
+  });
+  lane = 1; carX = 0; carVX = 0; speed = 16; dist = 0; cellCount = 0; spawnZ = -55; shake = 0;
+  vy = 0; airY = 0; safeLane = 1; canRestart = false;
+  cones.forEach(function(o){ o.active=false; o.obj.visible=false; });
+  cellsPool.forEach(function(o){ o.active=false; o.obj.visible=false; });
+  ramps.forEach(function(o){ o.active=false; o.obj.visible=false; });
+  traffic.forEach(function(o){ o.active=false; o.obj.visible=false; });
+  sweepers.forEach(function(o){ o.active=false; o.obj.visible=false; });
+  car.rotation.set(0,0,0); car.position.set(0,0,0);
+  elTitle.style.display='none'; elOver.style.display='none'; elHud.style.display='flex';
+  sfxStart(); engineOn();
+}
+function gameOver(){
+  STATE = 'dead';
+  engineOff(); sfxCrash(); shake = 1;
+  var score = Math.floor(dist) + cellCount*50;
+  if(score>best) best = score;
+  elFinal.textContent = score;
+  elBest.textContent = best;
+  canRestart = false;
+  gameOverTimer = setTimeout(function(){
+    gameOverTimer = null;
+    if(STATE !== 'dead') return;               // already restarted: do nothing
+    elOver.style.display='flex'; elHud.style.display='none';
+    canRestart = true;
+  }, 600);
+}
+
+/* ---- fair spawning: there is ALWAYS a survivable path ----
+   safeLane shifts at most one lane per pattern, and never shifts
+   into a lane currently occupied by a traffic car. */
+function trafficBlocked(l){
+  for(var i=0;i<traffic.length;i++){
+    if(traffic[i].active && traffic[i].lane===l && traffic[i].obj.position.z < 2) return true;
+  }
+  return false;
+}
+function pickGap(){
+  var opts = [safeLane];
+  if(safeLane>0 && !trafficBlocked(safeLane-1)) opts.push(safeLane-1);
+  if(safeLane<laneCount-1 && !trafficBlocked(safeLane+1)) opts.push(safeLane+1);
+  return opts[Math.floor(Math.random()*opts.length)];
+}
+function pickShiftGap(){
+  // forced lane change: staying put is NOT an option
+  var opts = [];
+  if(safeLane>0 && !trafficBlocked(safeLane-1)) opts.push(safeLane-1);
+  if(safeLane<laneCount-1 && !trafficBlocked(safeLane+1)) opts.push(safeLane+1);
+  if(!opts.length) return safeLane;
+  return opts[Math.floor(Math.random()*opts.length)];
+}
+function placeCone(x, z){
+  for(var i=0;i<cones.length;i++){
+    if(!cones[i].active){
+      cones[i].active = true;
+      cones[i].obj.visible = true;
+      cones[i].obj.position.set(x, 0, z);
+      return;
+    }
+  }
+}
+function rowAt(z, gap, noCell){
+  safeLane = gap;
+  // FAKES: wide roads get up to 3 fake-open lanes per wall
+  var fakes = {};
+  if(dist > 250){
+    var blocked = [];
+    for(var b=0;b<laneCount;b++) if(b!==gap) blocked.push(b);
+    var nf = (Math.random()<.45?1:0)
+           + (laneCount>=4 && Math.random()<.4?1:0);
+    while(nf-- > 0 && blocked.length){
+      var pi = Math.floor(Math.random()*blocked.length);
+      fakes[blocked.splice(pi,1)[0]] = true;
+    }
+  }
+  for(var l=0;l<laneCount;l++){
+    if(l===gap) continue;
+    var zz = z + (Math.random()*1.4-.7);
+    if(fakes[l]) zz = z - (3.0 + Math.random()*1.6);
+    placeCone(LANES[l], zz);
+  }
+  if(noCell) return;   // walls in tight groups never spawn batteries that could screen the next wall
+  if(Math.random()<.35) spawnCell(LANES[gap], 0, z - 4 - Math.random()*3);
+  if(dist > 250 && Math.random()<.28){
+    var bl = [];
+    for(var b2=0;b2<laneCount;b2++) if(b2!==gap && !fakes[b2]) bl.push(b2);
+    if(bl.length){
+      var bait = bl[Math.floor(Math.random()*bl.length)];
+      spawnCell(LANES[bait], 0, z + 9.5);   // clear daylight between bait and its cone
+    }
+  }
+}
+function spawnRow(z, forceShift, noCell){
+  // at 4 lanes, walls dictate your move ~1 in 3 times on top of everything else
+  if(!forceShift && Math.random() < (laneCount-3)*0.32) forceShift = true;
+  rowAt(z, forceShift ? pickShiftGap() : pickGap(), noCell);
+  return 'row';
+}
+function spawnSwing(z){
+  // THE SWING: a sprint to the far edge of the road, however wide it is.
+  // spacing scales with how many lanes you must cross.
+  var g1 = pickGap();
+  rowAt(z, g1, true);          // no battery between the two swing walls
+  var g2 = (g1 < (laneCount-1)/2) ? laneCount-1 : 0;
+  if(trafficBlocked(g2)) g2 = Math.floor(laneCount/2);
+  var laneDist = Math.abs(g2 - g1) || 1;
+  var step = Math.max(9, speed * (0.18 + 0.20*laneDist));
+  rowAt(z - step, g2, false);
+  extraDepth += step;
+  return 'swing';
+}
+function spawnCell(x, y, z){
+  for(var k=0;k<cellsPool.length;k++){
+    if(!cellsPool[k].active){
+      cellsPool[k].active = true;
+      cellsPool[k].obj.visible = true;
+      cellsPool[k].obj.position.set(x, y, z);
+      return;
+    }
+  }
+}
+function spawnRamp(z){
+  var l = safeLane;            // the safe path goes over the ramp
+  for(var i=0;i<ramps.length;i++){
+    if(!ramps[i].active){
+      ramps[i].active = true;
+      ramps[i].obj.visible = true;
+      ramps[i].obj.position.set(LANES[l], 0, z);
+      spawnCell(LANES[l], 1.6, z - 5);
+      spawnCell(LANES[l], 2.3, z - 9);
+      spawnCell(LANES[l], 1.6, z - 13);
+      return 'ramp';
+    }
+  }
+  return 'row';
+}
+function spawnTraffic(z){
+  var choices = [];
+  for(var l=0;l<laneCount;l++){
+    if(l!==safeLane && !trafficBlocked(l)) choices.push(l);
+  }
+  if(!choices.length) return spawnRow(z);
+  var lane2 = choices[Math.floor(Math.random()*choices.length)];
+  for(var i=0;i<traffic.length;i++){
+    if(!traffic[i].active){
+      traffic[i].active = true;
+      traffic[i].obj.visible = true;
+      traffic[i].obj.position.set(LANES[lane2], 0, z);
+      traffic[i].lane = lane2;
+      traffic[i].speed = speed * (0.35 + Math.random()*0.2);
+      return 'traffic';
+    }
+  }
+  return 'row';
+}
+var extraDepth = 0;   // how deep the last pattern extends past its anchor
+function spawnCluster(z){
+  var step = Math.max(5.5, speed*0.38);
+  spawnRow(z, false, true);          // no battery between the two walls
+  spawnRow(z - step, false, false);
+  extraDepth += step;
+  return 'cluster';
+}
+function spawnChain(z){
+  // THE GAUNTLET: every wall forces a lane change. one exact path through.
+  var n = 3 + (Math.random()<.5 ? 1 : 0) + (dist>1200 && Math.random()<.5 ? 1 : 0);
+  var step = Math.max(5, speed*0.34);
+  for(var i=0;i<n;i++) spawnRow(z - i*step, true, true);   // pure execution, zero clutter
+  extraDepth += (n-1)*step + speed*0.22;
+  return 'chain';
+}
+function spawnSweep(z){
+  var n = 1 + (dist>1200 && Math.random()<.6 ? 1 : 0);
+  var step = Math.max(8, speed*0.5);
+  var placed = 0;
+  for(var i=0;i<sweepers.length && placed<n;i++){
+    if(!sweepers[i].active){
+      sweepers[i].active = true;
+      sweepers[i].obj.visible = true;
+      sweepers[i].dir = Math.random()<.5 ? -1 : 1;
+      var startX = sweepers[i].dir === 1 ? LANES[0] : LANES[LANES.length-1];
+      sweepers[i].obj.position.set(startX, 0, z - placed*step);
+      placed++;
+    }
+  }
+  if(!placed) return spawnRow(z);
+  extraDepth += (placed-1)*step;
+  return 'sweep';
+}
+function spawnPattern(z){
+  extraDepth = 0;
+  if(dist < 100) return spawnRow(z);
+  var r = Math.random();
+  if(dist > 700 && r < .14) return spawnSweep(z);
+  if(dist > 500 && r < .32) return spawnChain(z);
+  if(dist > 250 && r < .50) return spawnCluster(z);
+  if(dist > 400 && r < .64) return spawnSwing(z);
+  if(r < .78) return spawnRow(z);
+  if(r < .90) return spawnRamp(z);
+  return spawnTraffic(z);
+}
+
+/* ============================================================
+   INPUT
+   ============================================================ */
+function steer(dir){
+  if(STATE!=='play') return;
+  lane = Math.max(0, Math.min(laneCount-1, lane+dir));
+  beep(220+lane*40,.05,'triangle',.06);
+}
+function action(){
+  if(STATE==='title') startGame();
+  else if(STATE==='dead' && canRestart) startGame();
+}
+window.addEventListener('keydown', function(e){
+  if(e.repeat) return;
+  if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') steer(-1);
+  else if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') steer(1);
+  else if(e.key==='Enter'||e.key===' ') action();
+});
+window.addEventListener('pointerdown', function(e){
+  audio();
+  if(STATE!=='play'){ action(); return; }
+  steer(e.clientX < window.innerWidth/2 ? -1 : 1);
+});
+
+/* ============================================================
+   MAIN LOOP
+   ============================================================ */
+var clock = new THREE.Clock();
+
+function loop(){
+  requestAnimationFrame(loop);
+  var dt = Math.min(clock.getDelta(), .05);
+  var t = clock.elapsedTime;
+
+  if(STATE==='play'){
+    speed = Math.min(54, speed + dt*1.15);
+    dist += speed*dt;
+    if(dist > nextReshapeDist) reshapePending = true;
+    if(reshapePending && roadAheadClear()){
+      reshapePending = false;
+      nextReshapeDist = dist + 300 + Math.random()*350;
+      reshapeRoad();
+    }
+    if(dist > nextBiomeDist){
+      nextBiomeDist = dist + 550 + Math.random()*350;
+      switchBiome();
+    }
+    elDist.textContent = Math.floor(dist);
+    elCells.textContent = cellCount;
+    if(engOsc) engOsc.frequency.value = 50 + speed*1.6;
+
+    /* steer: a stiff spring = same fast arrival, but smooth ease-in/ease-out
+       with a tiny natural overshoot, like a car carving into the lane */
+    carVX += ((LANES[lane] - carX) * 200 - carVX * 26) * dt;
+    carX += carVX * dt;
+    car.position.x = carX;
+    car.rotation.z = Math.max(-.3,  Math.min(.3,  carVX * .025));   // bank with the motion
+    car.rotation.y = Math.max(-.15, Math.min(.15, -carVX * .014));  // slight yaw into the turn
+
+    /* jump physics */
+    if(airY > 0 || vy > 0){
+      vy -= 24*dt;
+      airY += vy*dt;
+      if(airY <= 0){
+        airY = 0; vy = 0;
+        beep(95,.09,'square',.12);           // landing thump
+        shake = Math.max(shake, .25);
+      }
+      car.rotation.x = Math.max(-.35, Math.min(.45, vy*.05)); // nose up / down
+    } else {
+      car.rotation.x = 0;
+    }
+    car.position.y = airY + Math.abs(Math.sin(t*22)) * .015;
+
+    var dz = speed*dt;
+
+    /* scroll world */
+    roadSegs.forEach(function(s){
+      s.position.z += dz;
+      if(s.position.z > SEG_LEN) s.position.z -= SEG_LEN*SEG_COUNT;
+    });
+    hills.forEach(function(h){
+      h.position.z += dz;
+      if(h.position.z > 12){
+        h.position.z -= 82;
+        var side = Math.random()<.5?-1:1;
+        h.position.x = roadCenter + side*(ROAD_W/2 + 2 + Math.random()*7);
+      }
+    });
+    lamps.forEach(function(L){
+      L.position.z += dz;
+      if(L.position.z > 8) L.position.z -= 88;
+    });
+
+    /* obstacles & pickups */
+    spawnZ += dz;
+    if(spawnZ > -50){
+      var pz = -55 - Math.random()*6;
+      var kind = spawnPattern(pz);
+      // reaction window in TIME: starts snappy, shrinks to ~0.35s. brutal but possible
+      var secs = (0.62 + Math.random()*0.3) * Math.max(0.45, 1 - dist/2000);
+      var gapDist = Math.max(7, speed * secs) + extraDepth;
+      if(kind === 'ramp'){
+        var flight = 2*(6.5 + speed*0.11)/24;
+        gapDist += speed * flight * 0.8;
+      }
+      spawnZ = -55 - gapDist;
+    }
+    cones.forEach(function(o){
+      if(!o.active) return;
+      o.obj.position.z += dz;
+      if(o.obj.position.z > 6){ o.active=false; o.obj.visible=false; return; }
+      if(airY < .7 && Math.abs(o.obj.position.z) < 1.5 && Math.abs(o.obj.position.x - carX) < 1.1){
+        gameOver();
+      }
+    });
+    ramps.forEach(function(o){
+      if(!o.active) return;
+      o.obj.position.z += dz;
+      if(o.obj.position.z > 6){ o.active=false; o.obj.visible=false; return; }
+      if(airY <= 0 && Math.abs(o.obj.position.z) < 1.3 && Math.abs(o.obj.position.x - carX) < 1.1){
+        vy = 6.5 + speed*0.11;               // launch!
+        airY = 0.01;
+        beep(180,.3,'square',.09,640);       // rising whoosh
+      }
+    });
+    traffic.forEach(function(o){
+      if(!o.active) return;
+      o.obj.position.z += (speed - o.speed)*dt;
+      if(o.obj.position.z > 8){ o.active=false; o.obj.visible=false; return; }
+      if(airY < 1.1 && Math.abs(o.obj.position.z) < 2.1 && Math.abs(o.obj.position.x - carX) < 1.3){
+        gameOver();
+      }
+    });
+    sweepers.forEach(function(o){
+      if(!o.active) return;
+      o.obj.position.z += dz;
+      o.obj.position.x += o.dir * (2.6 + speed*0.045) * (1 + (laneCount-3)*0.15) * dt;
+      var minX = LANES[0], maxX = LANES[LANES.length-1];
+      if(o.obj.position.x > maxX){ o.obj.position.x = maxX; o.dir = -1; }
+      else if(o.obj.position.x < minX){ o.obj.position.x = minX; o.dir = 1; }
+      o.obj.rotation.y += dt*6;
+      if(o.obj.position.z > 6){ o.active=false; o.obj.visible=false; return; }
+      if(airY < .7 && Math.abs(o.obj.position.z) < 1.5 && Math.abs(o.obj.position.x - carX) < 1.05){
+        gameOver();
+      }
+    });
+    cellsPool.forEach(function(o){
+      if(!o.active) return;
+      o.obj.position.z += dz;
+      o.obj.rotation.y += dt*4;
+      if(o.obj.position.z > 6){ o.active=false; o.obj.visible=false; return; }
+      if(Math.abs(o.obj.position.z) < 1.7 &&
+         Math.abs(o.obj.position.x - carX) < 1.2 &&
+         Math.abs(o.obj.position.y - airY) < 1.4){
+        o.active=false; o.obj.visible=false;
+        cellCount++; sfxPickup();
+      }
+    });
+  }
+
+  if(STATE==='dead'){
+    car.rotation.y += dt*9*shake;
+    car.rotation.z += dt*5*shake;
+  }
+  shake = Math.max(0, shake - dt*1.2);
+
+  if(STATE==='title'){
+    carX = Math.sin(t*.6)*1.6;
+    car.position.x = carX;
+    car.rotation.z = Math.cos(t*.6)*.06;
+    roadSegs.forEach(function(s){
+      s.position.z += 10*dt;
+      if(s.position.z > SEG_LEN) s.position.z -= SEG_LEN*SEG_COUNT;
+    });
+    hills.forEach(function(h){
+      h.position.z += 10*dt;
+      if(h.position.z > 12) h.position.z -= 82;
+    });
+    lamps.forEach(function(L){
+      L.position.z += 10*dt;
+      if(L.position.z > 8) L.position.z -= 88;
+    });
+  }
+
+  /* road-reshape fog transition */
+  if(reshapeAnim){
+    var ra = reshapeAnim;
+    ra.t += dt;
+    var rp = Math.min(1, ra.t / ra.dur);
+    rp = rp*rp*(3-2*rp);
+    MAT.uniforms.fogFar.value = ra.fromFar + (ra.toFar - ra.fromFar)*rp;
+    if(ra.t >= ra.dur) reshapeAnim = null;
+  }
+
+  /* camera follow with crash shake */
+  var sx = (Math.random()-.5)*shake*.6;
+  var sy = (Math.random()-.5)*shake*.4;
+  camera.position.set(carX*.6 + roadCenter*.25 + sx, 2.6 + airY*.45 + sy, 5.4);
+  camera.lookAt(carX*.45 + roadCenter*.3, .7 + airY*.5, -6);
+
+  /* render low-res then upscale with dither */
+  renderer.setRenderTarget(lowTarget);
+  renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+  renderer.render(postScene, postCam);
+}
+
+function resize(){
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  var aspect = window.innerWidth / window.innerHeight;
+  LOW_H = 240;
+  LOW_W = Math.max(160, Math.round(LOW_H * aspect));
+  lowTarget.setSize(LOW_W, LOW_H);
+  postMat.uniforms.res.value.set(LOW_W, LOW_H);
+  MAT.uniforms.snap.value.set(LOW_W/2, LOW_H/2);
+  camera.aspect = aspect;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+loop();
+
+})();
+</script>
+</body>
+</html>
